@@ -11,6 +11,13 @@ def lorenz_deriv(X, sigma=10, rho=28, beta=8/3):
         X[0] * X[1] - beta * X[2]
     ))
 
+def lf_lorenz_deriv(X, sigma=10, rho=28, beta=8/3):
+    return jnp.array((
+        sigma * (X[1] - X[0]) + 0.1*X[2], 
+        X[0] * (rho - X[2]) - X[1] - 0.2*X[1], 
+        X[0] * X[1] - beta * X[2] + 0.5 * X[0]
+    ))
+
 # Simple function for discrete Euler steps 
 def euler_step(X, dXdt, dt):
     return X + dXdt(X) * dt 
@@ -128,11 +135,69 @@ def run_enkf(X_obs, X0_true, dt, process_var, obs_var,
 
     return jnp.array(means), jnp.array(stds)
 
+def run_mfenkf(X_obs, X0_true, dt, process_var, obs_var,
+             hf_size=50, lf_size = 100, H=None, seed=0):
+    """
+    Run EnKF over the full observation sequence.
+
+    Args:
+        X_obs      : (state_dim, n_steps) noisy observations
+        X0_true    : (state_dim,)         true initial state
+        dt         : float
+        process_var: float  – process noise variance
+        obs_var    : float  – observation noise variance
+        n_ensemble : int    – number of ensemble members
+        H          : observation matrix; defaults to full identity (observe all states)
+        seed       : int    – PRNG seed
+
+    Returns:
+        means : (state_dim, n_steps)  posterior mean at each step
+        stds  : (state_dim, n_steps)  posterior std  at each step
+    """
+    state_dim, n_steps = X_obs.shape
+    if H is None:
+        H = jnp.eye(state_dim)                                # observe everything
+    obs_dim = H.shape[0]
+
+    # ── initialise ensemble around the first observation ─────────────────
+    key = jrand.PRNGKey(seed)
+    key, hf_key, lf_key = jrand.split(key, 3)
+    hf_ensemble = X_obs[:, 0:1] + jnp.sqrt(obs_var) * jrand.normal(hf_key, shape=(state_dim, hf_size))
+    linked_ensemble = np.copy(hf_ensemble)
+    lf_ensemble = X_obs[:, 0:1] + jnp.sqrt(obs_var) * jrand.normal(lf_key, shape=(state_dim, lf_size))
+
+    means = np.zeros((state_dim, n_steps))
+    stds  = np.zeros((state_dim, n_steps))
+    means[:, 0] = hf_ensemble.mean(axis=1)
+    stds[:,  0] = hf_ensemble.std(axis=1)
+
+    for i in tqdm(range(1, n_steps)):
+        # split keys: one per ensemble member for forecast + one for analysis
+        key, fkey, akey = jrand.split(key, 3)
+        hf_fkeys = jrand.split(fkey, hf_size)               # (N, 2)
+        lf_fkeys = jrand.split(hf_fkeys[-1], lf_size)
+
+        # forecast
+        hf_ensemble = enkf_forecast(hf_fkeys, hf_ensemble, lorenz_deriv, dt, process_var)
+        linked_ensemble = enkf_forecast(hf_fkeys, linked_ensemble, lf_lorenz_deriv, dt, process_var)
+        lf_ensemble = enkf_forecast(lf_fkeys, lf_ensemble, lf_lorenz_deriv, dt, process_var)
+
+        # analysis
+        y = X_obs[:obs_dim, i]
+        hf_ensemble = enkf_analysis(hf_fkeys[0], hf_ensemble, y, H, obs_var)
+        linked_ensemble = enkf_analysis(hf_fkeys[0], linked_ensemble, y, H, obs_var)
+        lf_ensemble = enkf_analysis(lf_fkeys[0], lf_ensemble, y, H, obs_var)
+
+        means[:, i] = hf_ensemble.mean(axis=1) + (lf_ensemble.mean(axis=1) - linked_ensemble.mean(axis=1))
+        stds[:,  i] = lf_ensemble.std(axis=1) + (hf_ensemble - linked_ensemble).std(axis=1)
+
+    return jnp.array(means), jnp.array(stds)
+
 # ── main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # ── simulation parameters (unchanged from your code) ─────────────────
     X0         = jnp.ones(3)
-    t_end      = 2.0
+    t_end      = 5.0
     dt         = 1e-2
     n_steps    = int(jnp.ceil(t_end / dt))
     tspan      = jnp.linspace(0, t_end, n_steps)
@@ -140,17 +205,35 @@ if __name__ == "__main__":
     observ_var  = 20.0
 
     # %% ── generate ground truth and noisy observations ──────────────────────
-    X = np.zeros((3, n_steps));  X[:, 0] = X0
+    X = np.zeros((3, n_steps));  X[:, 0] = X0; 
+    Xlo = np.zeros((3, n_steps)); Xlo[:,0] = X0; 
     for i in range(1, n_steps):
         X[:, i] = euler_step(X[:, i-1], lorenz_deriv, dt)
+        Xlo[:,i] = euler_step(X[:,i-1], lf_lorenz_deriv, dt)
 
     Xr = np.zeros((3, n_steps));  Xr[:, 0] = X0; 
+    Xr_lo = np.zeros((3, n_steps)); Xr_lo[:,0] = X0; 
     Xobs = np.zeros_like(Xr); Xobs[:,0] = X0; 
     proc_keys = jrand.split(jrand.PRNGKey(42), n_steps)
     obsv_keys = jrand.split(jrand.PRNGKey(43), n_steps)
     for i in range(1, n_steps):
         Xr[:, i]   =  random_euler_step(proc_keys[i], Xr[:, i-1], lorenz_deriv, dt, var=process_var)
+        Xr_lo[:,i] =  random_euler_step(proc_keys[i], Xr_lo[:, i-1], lf_lorenz_deriv, dt, var=process_var)
         Xobs[:, i] = Xr[:,i] + jrand.normal(obsv_keys[i], shape=(3,)) * jnp.sqrt(observ_var)
+    # %% ── plot targets ──────────────────────────────────────────────────────────
+    labels = ["x(t)", "y(t)", "z(t)"]
+    figure(figsize=(16, 9), dpi=200)
+    for d in range(3):
+        subplot(3, 1, d + 1)
+        if d == 0:
+            title("EnKF estimate vs ground truth")
+        # plot(tspan, X[d, :],       color="tab:blue",   lw=0.8, label="truth")
+        plot(tspan, Xr[d, :],      color="black", lw=0.5, alpha=1.0, linestyle = 'solid', label="HF State")
+        plot(tspan, Xr_lo[d, :],      color="blue", lw=0.5, alpha=1.0, linestyle = 'dashed', label="LF State")
+        scatter(tspan, Xobs[d,:], color = "tab:blue", s = 1.0, alpha = 1.0, label = "HF Observed Data")
+        ylabel(labels[d]);  legend(loc="upper right", fontsize=7)
+        if d == 2:
+            xlabel("Time (t)")
 
     # %% ── run EnKF ──────────────────────────────────────────────────────────
     print("Running EnKF …")
@@ -159,17 +242,18 @@ if __name__ == "__main__":
         dt          = dt,
         process_var = process_var,
         obs_var     = observ_var,
-        n_ensemble  = 5,
+        n_ensemble  = 2,
+        seed = 42
     )
     print("Done.")
 
     # %% ── plot results ──────────────────────────────────────────────────────
     labels = ["x(t)", "y(t)", "z(t)"]
-    figure(figsize=(12, 12), dpi=200)
+    figure(figsize=(16, 9), dpi=200)
     for d in range(3):
         subplot(3, 1, d + 1)
         if d == 0:
-            title("EnKF estimate vs ground truth")
+            title("EnKF Estimate vs. Ground Truth (2 ensemble members)")
         # plot(tspan, X[d, :],       color="tab:blue",   lw=0.8, label="truth")
         plot(tspan, Xr[d, :],      color="black", lw=0.5, alpha=1.0, linestyle = 'solid', label="True State")
         plot(tspan, means[d, :],   color="tab:red",    lw=1.0, label="EnKF mean")
@@ -184,7 +268,39 @@ if __name__ == "__main__":
         if d == 2:
             xlabel("Time (t)")
 
-        
+    # %% ── run EnKF ──────────────────────────────────────────────────────────
+    print("Running MFEnKF …")
+    means, stds = run_mfenkf(
+        jnp.array(Xobs), X0,
+        dt          = dt,
+        process_var = process_var,
+        obs_var     = observ_var,
+        hf_size = 2, 
+        lf_size = 1000,
+        seed = 42
+    )
+    print("Done.")
+
+    # %% ── plot results ──────────────────────────────────────────────────────
+    labels = ["x(t)", "y(t)", "z(t)"]
+    figure(figsize=(16, 9), dpi=200)
+    for d in range(3):
+        subplot(3, 1, d + 1)
+        if d == 0:
+            title("MFEnKF Estimate vs. Ground Truth (2 HF & 1000 LF ensemble members)")
+        # plot(tspan, X[d, :],       color="tab:blue",   lw=0.8, label="truth")
+        plot(tspan, Xr[d, :],      color="black", lw=0.5, alpha=1.0, linestyle = 'solid', label="True State")
+        plot(tspan, means[d, :],   color="tab:red",    lw=1.0, label="MFEnKF mean")
+        fill_between(
+            tspan,
+            means[d, :] - 2 * stds[d, :],
+            means[d, :] + 2 * stds[d, :],
+            color="tab:red", alpha=0.2, label="±2σ"
+        )
+        scatter(tspan, Xobs[d,:], color = "tab:blue", s = 1.0, alpha = 1.0, label = "Observed Data")
+        ylabel(labels[d]);  legend(loc="upper right", fontsize=7)
+        if d == 2:
+            xlabel("Time (t)")
         
 
 
