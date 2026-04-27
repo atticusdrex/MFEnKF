@@ -88,7 +88,17 @@ def run_mfenkf(X_obs, X0_true, hf_size, lf_size):
         linked_ens = enkf_analysis(linked_ens, y, H, obs_var)
         lf_ens = enkf_analysis(lf_ens, y, H, obs_var)
         
-        means[:, i] = hf_ens.mean(axis=1) + (lf_ens.mean(axis=1) - linked_ens.mean(axis=1))
+        hf_mean = hf_ens.mean(axis=1)
+        lf_mean = lf_ens.mean(axis=1)
+        linked_mean = linked_ens.mean(axis=1)
+
+        corr = np.correlate(hf_mean[:N_pts], lf_mean[:N_pts], mode='full')
+        lag = np.argmax(corr) - (N_pts - 1)
+
+        aligned_lf_mean = np.concatenate([np.roll(lf_mean[:N_pts], lag), np.roll(lf_mean[N_pts:], lag)])
+        aligned_linked_mean = np.concatenate([np.roll(linked_mean[:N_pts], lag), np.roll(linked_mean[N_pts:], lag)])
+
+        means[:, i] = hf_mean + (aligned_lf_mean - aligned_linked_mean)
         stds[:, i] = lf_ens.std(axis=1) + (hf_ens - linked_ens).std(axis=1)
     return means, stds
 
