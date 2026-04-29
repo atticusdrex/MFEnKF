@@ -19,15 +19,19 @@ def lf_lorenz_deriv(X, sigma=10, rho=28, beta=8/3):
     ))
 
 # Simple function for discrete Euler steps 
-def euler_step(X, dXdt, dt):
-    return X + dXdt(X) * dt 
+def euler_step(X, dXdt, dt, n_steps = 1):
+    for step in range(n_steps):
+        X += dXdt(X) * dt 
+    return X 
 
 # euler step with random drift term 
-def random_euler_step(key, X, dXdt, dt, var = 1.0):
-    return X + dXdt(X) * dt + jnp.sqrt(var) * jrand.normal(key, shape=(3,))
-
+def random_euler_step(key, X, dXdt, dt, var = 1.0, n_steps = 1):
+    keys = jrand.split(key, n_steps)
+    for step in range(n_steps):
+        X += dXdt(X) * dt + jnp.sqrt(var) * jrand.normal(keys[step], shape=(3,))
+    return X 
 # ── EnKF ─────────────────────────────────────────────────────────────────────
-def enkf_forecast(keys, ensemble, dXdt, dt, process_var):
+def enkf_forecast(keys, ensemble, dXdt, dt, process_var, n_int_steps):
     """
     Propagate every ensemble member one step forward.
 
@@ -43,7 +47,7 @@ def enkf_forecast(keys, ensemble, dXdt, dt, process_var):
     """
     # vmap over columns: each member gets its own key
     def step_one(key, x):
-        return random_euler_step(key, x, dXdt, dt, var=process_var)
+        return random_euler_step(key, x, dXdt, dt, var=process_var, n_steps = n_int_steps)
 
     return jax.vmap(step_one, in_axes=(0, 1), out_axes=1)(keys, ensemble)
 
@@ -83,14 +87,13 @@ def enkf_analysis(key, ensemble_f, y, H, obs_var):
     return ensemble_f + K @ innovation                        # (state_dim, N)
 
 
-def run_enkf(X_obs, X0_true, dt, process_var, obs_var,
-             n_ensemble=50, H=None, seed=0):
+def run_enkf(X_obs, dt, process_var, obs_var,
+             n_ensemble=50, H=None, seed=0, n_int_steps = 1):
     """
     Run EnKF over the full observation sequence.
 
     Args:
         X_obs      : (state_dim, n_steps) noisy observations
-        X0_true    : (state_dim,)         true initial state
         dt         : float
         process_var: float  – process noise variance
         obs_var    : float  – observation noise variance
@@ -124,7 +127,7 @@ def run_enkf(X_obs, X0_true, dt, process_var, obs_var,
         fkeys = jrand.split(fkey, n_ensemble)               # (N, 2)
 
         # forecast
-        ensemble = enkf_forecast(fkeys, ensemble, lorenz_deriv, dt, process_var)
+        ensemble = enkf_forecast(fkeys, ensemble, lorenz_deriv, dt, process_var, n_int_steps)
 
         # analysis
         y = X_obs[:obs_dim, i]                               # current observation
@@ -135,14 +138,13 @@ def run_enkf(X_obs, X0_true, dt, process_var, obs_var,
 
     return jnp.array(means), jnp.array(stds)
 
-def run_mfenkf(X_obs, X0_true, dt, process_var, obs_var,
-             hf_size=50, lf_size = 100, H=None, seed=0):
+def run_mfenkf(X_obs, dt, process_var, obs_var,
+             hf_size=50, lf_size = 100, H=None, seed=0, n_int_steps = 1):
     """
     Run EnKF over the full observation sequence.
 
     Args:
         X_obs      : (state_dim, n_steps) noisy observations
-        X0_true    : (state_dim,)         true initial state
         dt         : float
         process_var: float  – process noise variance
         obs_var    : float  – observation noise variance
@@ -178,9 +180,9 @@ def run_mfenkf(X_obs, X0_true, dt, process_var, obs_var,
         lf_fkeys = jrand.split(hf_fkeys[-1], lf_size)
 
         # forecast
-        hf_ensemble = enkf_forecast(hf_fkeys, hf_ensemble, lorenz_deriv, dt, process_var)
-        linked_ensemble = enkf_forecast(hf_fkeys, linked_ensemble, lf_lorenz_deriv, dt, process_var)
-        lf_ensemble = enkf_forecast(lf_fkeys, lf_ensemble, lf_lorenz_deriv, dt, process_var)
+        hf_ensemble = enkf_forecast(hf_fkeys, hf_ensemble, lorenz_deriv, dt, process_var, n_int_steps)
+        linked_ensemble = enkf_forecast(hf_fkeys, linked_ensemble, lf_lorenz_deriv, dt, process_var, n_int_steps)
+        lf_ensemble = enkf_forecast(lf_fkeys, lf_ensemble, lf_lorenz_deriv, dt, process_var, n_int_steps)
 
         # analysis
         y = X_obs[:obs_dim, i]
@@ -199,17 +201,18 @@ if __name__ == "__main__":
     X0         = jnp.ones(3)
     t_end      = 5.0
     dt         = 1e-2
-    n_steps    = int(jnp.ceil(t_end / dt))
-    tspan      = jnp.linspace(0, t_end, n_steps)
     process_var = 3e-1
     observ_var  = 20.0
+    n_int_steps = 5 # number of intermediate steps between observation
+    n_steps    = int(jnp.ceil(t_end / dt / n_int_steps)) # number of total steps 
+    tspan      = jnp.linspace(0, t_end, n_steps)
 
     # %% ── generate ground truth and noisy observations ──────────────────────
     X = np.zeros((3, n_steps));  X[:, 0] = X0; 
     Xlo = np.zeros((3, n_steps)); Xlo[:,0] = X0; 
     for i in range(1, n_steps):
-        X[:, i] = euler_step(X[:, i-1], lorenz_deriv, dt)
-        Xlo[:,i] = euler_step(X[:,i-1], lf_lorenz_deriv, dt)
+        X[:, i] = euler_step(X[:, i-1], lorenz_deriv, dt, n_steps = n_int_steps)
+        Xlo[:,i] = euler_step(X[:,i-1], lf_lorenz_deriv, dt, n_steps = n_int_steps)
 
     Xr = np.zeros((3, n_steps));  Xr[:, 0] = X0; 
     Xr_lo = np.zeros((3, n_steps)); Xr_lo[:,0] = X0; 
@@ -217,8 +220,8 @@ if __name__ == "__main__":
     proc_keys = jrand.split(jrand.PRNGKey(42), n_steps)
     obsv_keys = jrand.split(jrand.PRNGKey(43), n_steps)
     for i in range(1, n_steps):
-        Xr[:, i]   =  random_euler_step(proc_keys[i], Xr[:, i-1], lorenz_deriv, dt, var=process_var)
-        Xr_lo[:,i] =  random_euler_step(proc_keys[i], Xr_lo[:, i-1], lf_lorenz_deriv, dt, var=process_var)
+        Xr[:, i]   =  random_euler_step(proc_keys[i], Xr[:, i-1], lorenz_deriv, dt, var=process_var, n_steps = n_int_steps)
+        Xr_lo[:,i] =  random_euler_step(proc_keys[i], Xr_lo[:, i-1], lf_lorenz_deriv, dt, var=process_var, n_steps = n_int_steps)
         Xobs[:, i] = Xr[:,i] + jrand.normal(obsv_keys[i], shape=(3,)) * jnp.sqrt(observ_var)
     # %% ── plot targets ──────────────────────────────────────────────────────────
     labels = ["x(t)", "y(t)", "z(t)"]
@@ -238,12 +241,13 @@ if __name__ == "__main__":
     # %% ── run EnKF ──────────────────────────────────────────────────────────
     print("Running EnKF …")
     means, stds = run_enkf(
-        jnp.array(Xobs), X0,
+        jnp.array(Xobs),
         dt          = dt,
         process_var = process_var,
         obs_var     = observ_var,
         n_ensemble  = 2,
-        seed = 42
+        seed = 42, 
+        n_int_steps = n_int_steps
     )
     print("Done.")
 
@@ -271,13 +275,14 @@ if __name__ == "__main__":
     # %% ── run EnKF ──────────────────────────────────────────────────────────
     print("Running MFEnKF …")
     means, stds = run_mfenkf(
-        jnp.array(Xobs), X0,
+        jnp.array(Xobs),
         dt          = dt,
         process_var = process_var,
         obs_var     = observ_var,
         hf_size = 2, 
         lf_size = 1000,
-        seed = 42
+        seed = 42, 
+        n_int_steps = n_int_steps
     )
     print("Done.")
 
